@@ -534,6 +534,7 @@ def main():
         def loss_fn(params):
             logits = state.apply_fn(**batch, params=params, dropout_rng=dropout_rng, train=True)[0]
             loss = state.loss_fn(logits, targets)
+            logger.info(f"loss = {loss}")
             return loss
 
         grad_fn = jax.value_and_grad(loss_fn)

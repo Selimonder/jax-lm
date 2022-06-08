@@ -90,7 +90,7 @@ def create_train_state(
           logits_fn: Applied to last layer to obtain the logits.
           loss_fn: Function to compute the loss.
         """
-
+        
         logits_fn: Callable = struct.field(pytree_node=False)
         loss_fn: Callable = struct.field(pytree_node=False)
 
@@ -106,18 +106,33 @@ def create_train_state(
     tx = optax.adamw(
         learning_rate=learning_rate_fn, b1=0.9, b2=0.999, eps=1e-6, weight_decay=weight_decay, mask=decay_mask_fn
     )
+    
+    is_regression = False
+    if is_regression:
 
-    def cross_entropy_loss(logits, labels):
-        xentropy = optax.softmax_cross_entropy(logits, onehot(labels, num_classes=num_labels))
-        return jnp.mean(xentropy)
+        def mse_loss(logits, labels):
+            return jnp.mean((logits[..., 0] - labels) ** 2)
 
-    return TrainState.create(
-        apply_fn=model.__call__,
-        params=model.params,
-        tx=tx,
-        logits_fn=lambda logits: logits.argmax(-1),
-        loss_fn=cross_entropy_loss,
-    )
+        return TrainState.create(
+            apply_fn=model.__call__,
+            params=model.params,
+            tx=tx,
+            logits_fn=lambda logits: logits[..., 0],
+            loss_fn=mse_loss,
+        )
+    else:  # Classification.
+
+        def cross_entropy_loss(logits, labels):
+            xentropy = optax.softmax_cross_entropy(logits, onehot(labels, num_classes=num_labels))
+            return jnp.mean(xentropy)
+
+        return TrainState.create(
+            apply_fn=model.__call__,
+            params=model.params,
+            tx=tx,
+            logits_fn=lambda logits: logits.argmax(-1),
+            loss_fn=cross_entropy_loss,
+        )
 
 
 # define step functions
@@ -137,13 +152,12 @@ def train_step(
     loss, grad = grad_fn(state.params)
     grad = jax.lax.pmean(grad, "batch")
     new_state = state.apply_gradients(grads=grad)
-    metrics = jax.lax.pmean({"loss": loss, "learning_rate": learning_rate_fn(state.step)}, axis_name="batch")
+    metrics = jax.lax.pmean({"loss": loss, "learning_rate": cfg.learning_rate_fn(state.step)}, axis_name="batch")
     return new_state, metrics, new_dropout_rng
 
 def eval_step(state, batch):
     logits = state.apply_fn(**batch, params=state.params, train=False)[0]
     return state.logits_fn(logits)
-
 
 def train_data_collator(rng: PRNGKey, dataset: Dataset, batch_size: int):
     """Returns shuffled batches of size `batch_size` from truncated `train dataset`, sharded over all local devices."""
@@ -154,65 +168,25 @@ def train_data_collator(rng: PRNGKey, dataset: Dataset, batch_size: int):
 
     for perm in perms:
         batch = dataset[perm]
-        discourse_id, input_ids, labels = dataset[perm]['discourse_id'], dataset[perm]['input_ids'], dataset[perm]['label']
-        batch.pop("discourse_id", None)
-        batch = {"input_ids": np.array(input_ids), "mask": [np.ones_like(x) for x in input_ids], "labels": np.array(labels)}
-
-        # calculate max token length of this batch
-        batch_max = cfg.max_len #max([len(ids) for ids in batch["input_ids"]])
-        # add padding
-        if tokenizer.padding_side == "right":
-            batch["input_ids"] = [s + (batch_max - len(s)) * [tokenizer.pad_token_id] for s in batch["input_ids"]]
-        else:
-            batch["input_ids"] = [(batch_max - len(s)) * [tokenizer.pad_token_id] + s for s in batch["input_ids"]]
-
-        batch['input_ids'] = [x[:batch_max] for x in batch['input_ids']]
-
-        batch['input_ids'] = np.stack(batch['input_ids'])
-        
-        masks = np.zeros_like(batch['input_ids'])
-        masks[batch['input_ids'] != tokenizer.pad_token_id] = 1
-        batch['mask'] = masks
-
-        batch.pop("mask", None)
-
-        # batch = {k: np.array(v) for k, v in batch.items()}
+        batch = {k: np.array(v) for k, v in batch.items()}
         batch = shard(batch)
+
         yield batch
+
 
 def eval_data_collator(dataset: Dataset, batch_size: int):
     """Returns batches of size `batch_size` from `eval dataset`, sharded over all local devices."""
     for i in range(len(dataset) // batch_size):
         batch = dataset[i * batch_size : (i + 1) * batch_size]
-        discourse_id, input_ids, labels = dataset[i * batch_size : (i + 1) * batch_size]['discourse_id'], dataset[i * batch_size : (i + 1) * batch_size]['input_ids'], dataset[i * batch_size : (i + 1) * batch_size]['label']
-        batch.pop("discourse_id", None)
-        batch = {"input_ids": np.array(input_ids), "mask": [np.ones_like(x) for x in input_ids], "labels": np.array(labels)}
-
-        # calculate max token length of this batch
-        batch_max = cfg.max_len #max([len(ids) for ids in batch["input_ids"]])
-        # add padding
-        if tokenizer.padding_side == "right":
-            batch["input_ids"] = [s + (batch_max - len(s)) * [tokenizer.pad_token_id] for s in batch["input_ids"]]
-        else:
-            batch["input_ids"] = [(batch_max - len(s)) * [tokenizer.pad_token_id] + s for s in batch["input_ids"]]
-
-        batch['input_ids'] = [x[:batch_max] for x in batch['input_ids']]
-
-        batch['input_ids'] = np.stack(batch['input_ids'])
-        
-        masks = np.zeros_like(batch['input_ids'])
-        masks[batch['input_ids'] != tokenizer.pad_token_id] = 1
-        batch['mask'] = masks
-        batch.pop("mask", None)
-
-        # batch = {k: np.array(v) for k, v in batch.items()}
+        batch = {k: np.array(v) for k, v in batch.items()}
         batch = shard(batch)
 
         yield batch
 
     
-def main():
-    
+
+
+if __name__ == "__main__":
     # Logger
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
@@ -247,6 +221,8 @@ def main():
         #use_auth_token=True if cfg.use_auth_token else None,
     )
 
+    cfg.tokenizer = tokenizer
+
     # TODO: check overlapping data
     # Choose a fold
     logger.info(f"creating dataset for fold {cfg.fold}")
@@ -270,8 +246,10 @@ def main():
         cfg.learning_rate,
     )
 
+    cfg.learning_rate_fn = learning_rate_fn
+
     state = create_train_state(
-        model, learning_rate_fn, num_labels=cfg.num_labels, weight_decay=cfg.weight_decay
+        model, cfg.learning_rate_fn, num_labels=cfg.num_labels, weight_decay=cfg.weight_decay
     )
 
     p_train_step = jax.pmap(train_step, axis_name="batch", donate_argnums=(0,))
@@ -325,7 +303,7 @@ def main():
                 )
 
                 train_metrics = []
-
+            
             if (cur_step % cfg.eval_steps == 0 or cur_step % steps_per_epoch == 0) and cur_step > 0:
 
                 # evaluate
@@ -349,27 +327,6 @@ def main():
                     batch = eval_dataset[-num_leftover_samples:]
                     batch = {k: np.array(v) for k, v in batch.items()}
 
-                    discourse_id, input_ids, labels = eval_dataset[-num_leftover_samples:]['discourse_id'], eval_dataset[-num_leftover_samples:]['input_ids'], eval_dataset[-num_leftover_samples:]['label']
-                    batch.pop("discourse_id", None)
-                    batch = {"input_ids": np.array(input_ids), "mask": [np.ones_like(x) for x in input_ids], "labels": np.array(labels)}
-
-                    # calculate max token length of this batch
-                    batch_max = cfg.max_len #max([len(ids) for ids in batch["input_ids"]])
-                    # add padding
-                    if tokenizer.padding_side == "right":
-                        batch["input_ids"] = [s + (batch_max - len(s)) * [tokenizer.pad_token_id] for s in batch["input_ids"]]
-                    else:
-                        batch["input_ids"] = [(batch_max - len(s)) * [tokenizer.pad_token_id] + s for s in batch["input_ids"]]
-
-                    batch['input_ids'] = [x[:batch_max] for x in batch['input_ids']]
-
-                    batch['input_ids'] = np.stack(batch['input_ids'])
-                    
-                    masks = np.zeros_like(batch['input_ids'])
-                    masks[batch['input_ids'] != tokenizer.pad_token_id] = 1
-                    batch['mask'] = masks
-                    batch.pop("mask", None)
-
                     labels = batch.pop("labels")
                     predictions = eval_step(unreplicate(state), batch)
                     metric.add_batch(predictions=predictions, references=labels)
@@ -377,6 +334,7 @@ def main():
                 eval_metric = metric.compute()
 
                 logger.info(f"Step... ({cur_step}/{total_steps} | Eval metrics: {eval_metric})")
+
 
             if (cur_step % cfg.save_steps == 0 and cur_step > 0) or (cur_step == total_steps):
                 # save checkpoint after each epoch and push checkpoint to the hub
@@ -391,9 +349,6 @@ def main():
     # save the eval metrics in json
     if jax.process_index() == 0:
         eval_metric = {f"eval_{metric_name}": value for metric_name, value in eval_metric.items()}
-        path = os.path.join(cfg.output_dir, "eval_results.json")
+        path = os.path.join(training_args.output_dir, "eval_results.json")
         with open(path, "w") as f:
             json.dump(eval_metric, f, indent=4, sort_keys=True)
-            
-if __name__ == "__main__":
-    main()
