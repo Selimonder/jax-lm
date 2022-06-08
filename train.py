@@ -1,5 +1,5 @@
 """Minimal training script using Jax/Flax/HF"""
-import os, sys, time
+import os, sys, time, json
 import argparse
 import logging
 import importlib
@@ -34,6 +34,8 @@ import numpy as np
 from tqdm import tqdm
 from copy import copy
 from transformers.utils import check_min_version, get_full_repo_name
+
+from itertools import chain
 
 Array = Any
 Dataset = datasets.arrow_dataset.Dataset
@@ -157,7 +159,7 @@ def train_data_collator(rng: PRNGKey, dataset: Dataset, batch_size: int):
         batch = {"input_ids": np.array(input_ids), "mask": [np.ones_like(x) for x in input_ids], "labels": np.array(labels)}
 
         # calculate max token length of this batch
-        batch_max = 512 #max([len(ids) for ids in batch["input_ids"]])
+        batch_max = cfg.max_len #max([len(ids) for ids in batch["input_ids"]])
         # add padding
         if tokenizer.padding_side == "right":
             batch["input_ids"] = [s + (batch_max - len(s)) * [tokenizer.pad_token_id] for s in batch["input_ids"]]
@@ -187,7 +189,7 @@ def eval_data_collator(dataset: Dataset, batch_size: int):
         batch = {"input_ids": np.array(input_ids), "mask": [np.ones_like(x) for x in input_ids], "labels": np.array(labels)}
 
         # calculate max token length of this batch
-        batch_max = 512 #max([len(ids) for ids in batch["input_ids"]])
+        batch_max = cfg.max_len #max([len(ids) for ids in batch["input_ids"]])
         # add padding
         if tokenizer.padding_side == "right":
             batch["input_ids"] = [s + (batch_max - len(s)) * [tokenizer.pad_token_id] for s in batch["input_ids"]]
@@ -209,7 +211,7 @@ def eval_data_collator(dataset: Dataset, batch_size: int):
         yield batch
 
     
-if __name__ == "__main__":
+def main():
     
     # Logger
     # Make one log on every process with the configuration for debugging.
@@ -257,6 +259,8 @@ if __name__ == "__main__":
 
     train_batch_size = cfg.per_device_train_batch_size * jax.local_device_count()
     eval_batch_size = cfg.per_device_eval_batch_size * jax.local_device_count()
+
+    logger.info(f"local device count {jax.local_device_count()}")
 
     learning_rate_fn = create_learning_rate_fn(
         len(train_dataset),
@@ -306,13 +310,90 @@ if __name__ == "__main__":
             ),
         ):
             state, train_metric, dropout_rngs = p_train_step(state, batch, dropout_rngs)
-            
             train_metrics.append(train_metric)
 
-            train_metric = unreplicate(train_metric)
             cur_step = (epoch * steps_per_epoch) + (step + 1)
-            if jax.process_index() == 0:
+
+            if cur_step % cfg.logging_steps == 0 and cur_step > 0:
+                # Save metrics
+                train_metric = unreplicate(train_metric)
+                train_time += time.time() - train_start
+
                 epochs.write(
                     f"Step... ({cur_step}/{total_steps} | Training Loss: {train_metric['loss']}, Learning Rate:"
                     f" {train_metric['learning_rate']})"
                 )
+
+                train_metrics = []
+
+            if (cur_step % cfg.eval_steps == 0 or cur_step % steps_per_epoch == 0) and cur_step > 0:
+
+                # evaluate
+                eval_loader = eval_data_collator(eval_dataset, eval_batch_size)
+                for batch in tqdm(
+                    eval_loader,
+                    total=len(eval_dataset) // eval_batch_size,
+                    desc="Evaluating ...",
+                    position=2,
+                ):
+                    labels = batch.pop("labels")
+                    predictions = p_eval_step(state, batch)
+                    metric.add_batch(predictions=chain(*predictions), references=chain(*labels))
+
+                # evaluate also on leftover examples (not divisible by batch_size)
+                num_leftover_samples = len(eval_dataset) % eval_batch_size
+
+                # make sure leftover batch is evaluated on one device
+                if num_leftover_samples > 0 and jax.process_index() == 0:
+                    # take leftover samples
+                    batch = eval_dataset[-num_leftover_samples:]
+                    batch = {k: np.array(v) for k, v in batch.items()}
+
+                    discourse_id, input_ids, labels = eval_dataset[-num_leftover_samples:]['discourse_id'], eval_dataset[-num_leftover_samples:]['input_ids'], eval_dataset[-num_leftover_samples:]['label']
+                    batch.pop("discourse_id", None)
+                    batch = {"input_ids": np.array(input_ids), "mask": [np.ones_like(x) for x in input_ids], "labels": np.array(labels)}
+
+                    # calculate max token length of this batch
+                    batch_max = cfg.max_len #max([len(ids) for ids in batch["input_ids"]])
+                    # add padding
+                    if tokenizer.padding_side == "right":
+                        batch["input_ids"] = [s + (batch_max - len(s)) * [tokenizer.pad_token_id] for s in batch["input_ids"]]
+                    else:
+                        batch["input_ids"] = [(batch_max - len(s)) * [tokenizer.pad_token_id] + s for s in batch["input_ids"]]
+
+                    batch['input_ids'] = [x[:batch_max] for x in batch['input_ids']]
+
+                    batch['input_ids'] = np.stack(batch['input_ids'])
+                    
+                    masks = np.zeros_like(batch['input_ids'])
+                    masks[batch['input_ids'] != tokenizer.pad_token_id] = 1
+                    batch['mask'] = masks
+                    batch.pop("mask", None)
+
+                    labels = batch.pop("labels")
+                    predictions = eval_step(unreplicate(state), batch)
+                    metric.add_batch(predictions=predictions, references=labels)
+
+                eval_metric = metric.compute()
+
+                logger.info(f"Step... ({cur_step}/{total_steps} | Eval metrics: {eval_metric})")
+
+            if (cur_step % cfg.save_steps == 0 and cur_step > 0) or (cur_step == total_steps):
+                # save checkpoint after each epoch and push checkpoint to the hub
+                if jax.process_index() == 0:
+                    params = jax.device_get(unreplicate(state.params))
+                    model.save_pretrained(cfg.output_dir, params=params)
+                    tokenizer.save_pretrained(cfg.output_dir)
+                    if cfg.push_to_hub:
+                        repo.push_to_hub(commit_message=f"Saving weights and logs of step {cur_step}", blocking=False)
+            epochs.desc = f"Epoch ... {epoch + 1}/{num_epochs}"
+
+    # save the eval metrics in json
+    if jax.process_index() == 0:
+        eval_metric = {f"eval_{metric_name}": value for metric_name, value in eval_metric.items()}
+        path = os.path.join(cfg.output_dir, "eval_results.json")
+        with open(path, "w") as f:
+            json.dump(eval_metric, f, indent=4, sort_keys=True)
+            
+if __name__ == "__main__":
+    main()
