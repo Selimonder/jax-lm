@@ -349,6 +349,6 @@ if __name__ == "__main__":
     # save the eval metrics in json
     if jax.process_index() == 0:
         eval_metric = {f"eval_{metric_name}": value for metric_name, value in eval_metric.items()}
-        path = os.path.join(training_args.output_dir, "eval_results.json")
+        path = os.path.join(cfg.output_dir, "eval_results.json")
         with open(path, "w") as f:
             json.dump(eval_metric, f, indent=4, sort_keys=True)

@@ -3,3 +3,6 @@ datasets/
 jax/
 
 folds/
+
+outs/
+outs_1/
