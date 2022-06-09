@@ -46,7 +46,7 @@ PRNGKey = Any
 logger = logging.getLogger(__name__)
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
-check_min_version("4.20.0.dev0")
+# check_min_version("4.20.0.dev0")
 
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 sys.path.append("configs")
