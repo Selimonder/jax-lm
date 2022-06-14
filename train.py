@@ -107,32 +107,18 @@ def create_train_state(
         learning_rate=learning_rate_fn, b1=0.9, b2=0.999, eps=1e-6, weight_decay=weight_decay, mask=decay_mask_fn
     )
     
-    is_regression = False
-    if is_regression:
 
-        def mse_loss(logits, labels):
-            return jnp.mean((logits[..., 0] - labels) ** 2)
+    def cross_entropy_loss(logits, labels):
+        xentropy = optax.softmax_cross_entropy(logits, onehot(labels, num_classes=num_labels))
+        return jnp.mean(xentropy)
 
-        return TrainState.create(
-            apply_fn=model.__call__,
-            params=model.params,
-            tx=tx,
-            logits_fn=lambda logits: logits[..., 0],
-            loss_fn=mse_loss,
-        )
-    else:  # Classification.
-
-        def cross_entropy_loss(logits, labels):
-            xentropy = optax.softmax_cross_entropy(logits, onehot(labels, num_classes=num_labels))
-            return jnp.mean(xentropy)
-
-        return TrainState.create(
-            apply_fn=model.__call__,
-            params=model.params,
-            tx=tx,
-            logits_fn=lambda logits: logits.argmax(-1),
-            loss_fn=cross_entropy_loss,
-        )
+    return TrainState.create(
+        apply_fn=model.__call__,
+        params=model.params,
+        tx=tx,
+        logits_fn=lambda logits: logits.argmax(-1),
+        loss_fn=cross_entropy_loss,
+    )
 
 
 # define step functions
@@ -218,6 +204,7 @@ if __name__ == "__main__":
     model = FlaxAutoModelForSequenceClassification.from_pretrained(
         cfg.model_name_or_path,
         config=config,
+        ignore_mismatched_sizes=True,
         #use_auth_token=True if cfg.use_auth_token else None,
     )
 
@@ -268,6 +255,10 @@ if __name__ == "__main__":
     total_steps = steps_per_epoch * num_epochs
     epochs = tqdm(range(num_epochs), desc=f"Epoch ... (0/{num_epochs})", position=0)
 
+
+    # best metrics
+    best_accuracy = 0
+    best_loss     = float("inf")
     for epoch in epochs:
 
         train_start = time.time()
@@ -332,19 +323,30 @@ if __name__ == "__main__":
                     metric.add_batch(predictions=predictions, references=labels)
 
                 eval_metric = metric.compute()
+                
+                # save best model
+                if eval_metric["accuracy"] > best_accuracy:
+                    logger.info(f"validation accuracy improved from {best_accuracy} to {eval_metric['accuracy']}")
 
+                    best_accuracy = eval_metric["accuracy"]
+                    #best_loss = eval_metric["loss"]
+                    if jax.process_index() == 0:
+                        params = jax.device_get(unreplicate(state.params))
+                        model.save_pretrained(cfg.output_dir, params=params)
+                        tokenizer.save_pretrained(cfg.output_dir)
+                        
                 logger.info(f"Step... ({cur_step}/{total_steps} | Eval metrics: {eval_metric})")
 
 
-            if (cur_step % cfg.save_steps == 0 and cur_step > 0) or (cur_step == total_steps):
-                # save checkpoint after each epoch and push checkpoint to the hub
-                if jax.process_index() == 0:
-                    params = jax.device_get(unreplicate(state.params))
-                    model.save_pretrained(cfg.output_dir, params=params)
-                    tokenizer.save_pretrained(cfg.output_dir)
-                    if cfg.push_to_hub:
-                        repo.push_to_hub(commit_message=f"Saving weights and logs of step {cur_step}", blocking=False)
-            epochs.desc = f"Epoch ... {epoch + 1}/{num_epochs}"
+            # if (cur_step % cfg.save_steps == 0 and cur_step > 0) or (cur_step == total_steps):
+            #     # save checkpoint after each epoch and push checkpoint to the hub
+            #     if jax.process_index() == 0:
+            #         params = jax.device_get(unreplicate(state.params))
+            #         model.save_pretrained(cfg.output_dir, params=params)
+            #         tokenizer.save_pretrained(cfg.output_dir)
+            #         if cfg.push_to_hub:
+            #             repo.push_to_hub(commit_message=f"Saving weights and logs of step {cur_step}", blocking=False)
+            # epochs.desc = f"Epoch ... {epoch + 1}/{num_epochs}"
 
     # save the eval metrics in json
     if jax.process_index() == 0:
