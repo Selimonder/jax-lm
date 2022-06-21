@@ -13,6 +13,7 @@ import jax
 import jax.numpy as jnp
 import optax
 
+import flax
 from flax import struct, traverse_util
 from flax.jax_utils import replicate, unreplicate
 from flax.training import train_state
@@ -34,6 +35,7 @@ import numpy as np
 from tqdm import tqdm
 from copy import copy
 from transformers.utils import check_min_version, get_full_repo_name
+from sklearn.metrics import log_loss
 
 from itertools import chain
 
@@ -58,6 +60,14 @@ parser.add_argument("-s", "--seed", type=int, default=-1, help="seed")
 parser.add_argument("-f", "--fold", type=int, default=-1, help="fold")
 parser_args, _ = parser.parse_known_args(sys.argv)
 cfg = copy(importlib.import_module(parser_args.config).cfg)
+
+## set fold
+cfg.fold = parser_args.fold
+cfg.output_dir = f"{cfg.output_dir}/fold_{cfg.fold}/"
+os.makedirs(cfg.output_dir, exist_ok=True)
+
+logger.info(f"for fold {cfg.fold}")
+    
 
 def create_learning_rate_fn(
     train_ds_size: int, train_batch_size: int, num_train_epochs: int, num_warmup_steps: int, learning_rate: float
@@ -106,18 +116,44 @@ def create_train_state(
     tx = optax.adamw(
         learning_rate=learning_rate_fn, b1=0.9, b2=0.999, eps=1e-6, weight_decay=weight_decay, mask=decay_mask_fn
     )
-    
 
-    def cross_entropy_loss(logits, labels):
-        xentropy = optax.softmax_cross_entropy(logits, onehot(labels, num_classes=num_labels))
-        return jnp.mean(xentropy)
+    def get_loss(loss_type):
+        if loss_type == "ce":
+            logger.info(f"loss type: {loss_type}")
+            def cross_entropy_loss(logits, labels):
+                xentropy = optax.softmax_cross_entropy(logits, onehot(labels, num_classes=num_labels))
+                return jnp.mean(xentropy)
+            return cross_entropy_loss
+        elif loss_type == "poly1_ce":
+            logger.info(f"loss type: {loss_type}")
+            def poly1_cross_entropy(logits, labels, epsilon=1.0):
+                labels = onehot(labels, num_classes=3)
+                pt = jnp.sum(labels * flax.linen.softmax(logits), axis=-1)
+                CE = optax.softmax_cross_entropy(logits, labels)
+                Poly1 = CE + epsilon * (1 - pt)
+                return jnp.mean(Poly1) ## mean?
+            return poly1_cross_entropy
+        elif loss_type == "poly1_ce_ls":
+            logger.info(f"loss type: {loss_type}")
+            def poly1_cross_entropy_ls(logits, labels, epsilon = 1.0, alpha = 0.1):
+                num_classes = 3
+                labels = onehot(labels, num_classes=3)
+                smooth_labels = labels * (1-alpha) + alpha/num_classes
+                one_minus_pt = jnp.sum(smooth_labels * (1 - flax.linen.softmax(logits)), axis=-1)
+                CE = optax.softmax_cross_entropy(logits, smooth_labels)
+                Poly1 = CE + epsilon * one_minus_pt
+                return jnp.mean(Poly1)
+            return poly1_cross_entropy_ls
+
+
+    loss_fn = get_loss(cfg.loss_type)
 
     return TrainState.create(
         apply_fn=model.__call__,
         params=model.params,
         tx=tx,
         logits_fn=lambda logits: logits.argmax(-1),
-        loss_fn=cross_entropy_loss,
+        loss_fn=loss_fn,
     )
 
 
@@ -142,8 +178,10 @@ def train_step(
     return new_state, metrics, new_dropout_rng
 
 def eval_step(state, batch):
+    targets = batch.pop("labels")
     logits = state.apply_fn(**batch, params=state.params, train=False)[0]
-    return state.logits_fn(logits)
+    loss = state.loss_fn(logits, targets)
+    return state.logits_fn(logits), loss, unreplicate(logits), unreplicate(targets)
 
 def train_data_collator(rng: PRNGKey, dataset: Dataset, batch_size: int):
     """Returns shuffled batches of size `batch_size` from truncated `train dataset`, sharded over all local devices."""
@@ -170,6 +208,9 @@ def eval_data_collator(dataset: Dataset, batch_size: int):
         yield batch
 
     
+def get_model(cfg):
+    Net = importlib.import_module(cfg.model).Net
+    return Net(cfg, config_path=None, pretrained=True)
 
 
 if __name__ == "__main__":
@@ -278,10 +319,10 @@ if __name__ == "__main__":
                 position=1,
             ),
         ):
+            cur_step = (epoch * steps_per_epoch) + (step + 1)
+
             state, train_metric, dropout_rngs = p_train_step(state, batch, dropout_rngs)
             train_metrics.append(train_metric)
-
-            cur_step = (epoch * steps_per_epoch) + (step + 1)
 
             if cur_step % cfg.logging_steps == 0 and cur_step > 0:
                 # Save metrics
@@ -298,6 +339,10 @@ if __name__ == "__main__":
             if (cur_step % cfg.eval_steps == 0 or cur_step % steps_per_epoch == 0) and cur_step > 0:
 
                 # evaluate
+                eval_losses = []
+                eval_preds  = []
+                eval_labels = []
+
                 eval_loader = eval_data_collator(eval_dataset, eval_batch_size)
                 for batch in tqdm(
                     eval_loader,
@@ -305,8 +350,13 @@ if __name__ == "__main__":
                     desc="Evaluating ...",
                     position=2,
                 ):
-                    labels = batch.pop("labels")
-                    predictions = p_eval_step(state, batch)
+                    labels = batch["labels"]
+                    predictions, losses, logits_, targets_ = p_eval_step(state, batch)
+                    eval_losses.extend(losses)
+
+                    eval_preds.extend(logits_)
+                    eval_labels.extend(onehot(targets_, 3))
+
                     metric.add_batch(predictions=chain(*predictions), references=chain(*labels))
 
                 # evaluate also on leftover examples (not divisible by batch_size)
@@ -318,22 +368,48 @@ if __name__ == "__main__":
                     batch = eval_dataset[-num_leftover_samples:]
                     batch = {k: np.array(v) for k, v in batch.items()}
 
-                    labels = batch.pop("labels")
-                    predictions = eval_step(unreplicate(state), batch)
-                    metric.add_batch(predictions=predictions, references=labels)
+                    labels = batch['labels']
+                    predictions, losses, logits_, targets_ = eval_step(unreplicate(state), batch)
+                    eval_losses.append(losses)
 
+                    eval_preds.append(logits_)
+                    eval_labels.append(onehot(targets_, 3))
+            
+                    metric.add_batch(predictions=predictions, references=labels)
+            
                 eval_metric = metric.compute()
                 
-                # save best model
-                if eval_metric["accuracy"] > best_accuracy:
-                    logger.info(f"validation accuracy improved from {best_accuracy} to {eval_metric['accuracy']}")
+                eval_loss = jnp.mean(jnp.stack(jnp.array(eval_losses)))
+                logger.info(f"eval loss {eval_loss}")
 
-                    best_accuracy = eval_metric["accuracy"]
-                    #best_loss = eval_metric["loss"]
+                if jax.process_index() == 0:
+                    eval_labels = jnp.stack(eval_labels)
+                    eval_preds = flax.linen.softmax(jnp.stack(eval_preds))
+
+                    logger.info(f"eval_labels shape {eval_labels.shape} - eval_preds shape {eval_preds.shape}")
+
+                comp_loss = log_loss(eval_labels, eval_preds)
+
+                logger.info(f"competition loss {comp_loss}")
+                
+                # save best model
+                if comp_loss < best_loss:
+                    logger.info(f"new best: {comp_loss} from {best_loss}")
+                    best_loss = comp_loss
                     if jax.process_index() == 0:
                         params = jax.device_get(unreplicate(state.params))
                         model.save_pretrained(cfg.output_dir, params=params)
                         tokenizer.save_pretrained(cfg.output_dir)
+
+                        # save eval metric
+                        # eval_metric = {"loss": eval_loss, "epoch": epoch}
+                        eval_metric = f"""epoch {epoch} | competition loss {comp_loss} | eval loss {eval_loss}"""
+                        path = os.path.join(cfg.output_dir, "eval_results.txt")
+                        with open(path, "a") as f:
+                            f.write(f"{eval_metric}\n")
+                            #json.dump(eval_metric, f, indent=4, sort_keys=True)
+
+                        logger.info(f"saved...")
                         
                 logger.info(f"Step... ({cur_step}/{total_steps} | Eval metrics: {eval_metric})")
 
@@ -348,9 +424,3 @@ if __name__ == "__main__":
             #             repo.push_to_hub(commit_message=f"Saving weights and logs of step {cur_step}", blocking=False)
             # epochs.desc = f"Epoch ... {epoch + 1}/{num_epochs}"
 
-    # save the eval metrics in json
-    if jax.process_index() == 0:
-        eval_metric = {f"eval_{metric_name}": value for metric_name, value in eval_metric.items()}
-        path = os.path.join(cfg.output_dir, "eval_results.json")
-        with open(path, "w") as f:
-            json.dump(eval_metric, f, indent=4, sort_keys=True)
