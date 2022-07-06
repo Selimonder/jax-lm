@@ -4,7 +4,9 @@ import argparse
 import logging
 import importlib
 
-from typing import Any, Callable, Dict, Optional, Tuple
+os.environ["JAX_ENABLE_X64"] = "False"
+
+from typing import Any, Callable, Dict, Optional, Tuple, NamedTuple
 
 import datasets
 from datasets import load_dataset, load_metric
@@ -50,8 +52,13 @@ check_min_version("4.20.0.dev0")
 
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 sys.path.append("configs")
+sys.path.append("shampoo")
 # sys.path.append("models")
 # sys.path.append("data")
+
+
+## shampoo rltd.
+from shampoo.distributed_shampoo import GraftingType, distributed_shampoo
 
 parser = argparse.ArgumentParser(description="")
 
@@ -113,17 +120,63 @@ def create_train_state(
         flat_mask = {path: (path[-1] != "bias" and path[-2:] != ("LayerNorm", "scale")) for path in flat_params}
         return traverse_util.unflatten_dict(flat_mask)
 
-    tx = optax.adamw(
-        learning_rate=learning_rate_fn, b1=0.9, b2=0.999, eps=1e-6, weight_decay=weight_decay, mask=decay_mask_fn
-    )
+
+    if cfg.optimizer_type == "adamw":
+        tx = optax.adamw(
+            learning_rate=learning_rate_fn, b1=0.9, b2=0.999, eps=1e-6, weight_decay=weight_decay, mask=decay_mask_fn
+        )
+    elif cfg.optimizer_type == "shampoo":
+        logger.info("shampoo optimizer")
+
+        from jax.experimental import PartitionSpec, maps
+        tx = distributed_shampoo(
+            learning_rate_fn,
+            block_size=128,
+            beta1=0.9,
+            beta2=0.999,
+            diagonal_epsilon=1e-10,
+            matrix_epsilon=1e-6,
+            start_preconditioning_step=max(
+                10 + 1, 101
+            ),
+            preconditioning_compute_steps=10,
+            statistics_compute_steps=1,
+            best_effort_shape_interpretation=True,
+            graft_type="adagrad_normalized",
+            nesterov=False,
+            exponent_override=0,
+            statistics_partition_spec=None,#PartitionSpec(None, "dp", None),
+            preconditioner_partition_spec=None,#PartitionSpec("dp", None, None),
+            num_devices_for_pjit=None,
+            batch_axis_name="batch",
+            shard_optimizer_states=False,
+            inverse_failure_threshold=0.1,
+            moving_average_for_momentum=True,
+            skip_preconditioning_dim_size_gt=256,
+            clip_by_scaled_gradient_norm=None,
+            precision=jax.lax.Precision.HIGHEST,
+            best_effort_memory_usage_reduction=False,
+        )
 
     def get_loss(loss_type):
         if loss_type == "ce":
             logger.info(f"loss type: {loss_type}")
             def cross_entropy_loss(logits, labels):
-                xentropy = optax.softmax_cross_entropy(logits, onehot(labels, num_classes=num_labels))
+                labels = onehot(labels, num_classes=num_labels)
+                xentropy = optax.softmax_cross_entropy(logits, labels)
                 return jnp.mean(xentropy)
             return cross_entropy_loss
+
+        elif loss_type == "ce_smooth":
+            logger.info(f"loss type: {loss_type}")
+            def cross_entropy_loss(logits, labels):
+                labels = onehot(labels, num_classes=num_labels)
+                ##TODO: refactor label-smooting
+                labels = optax.smooth_labels(labels, cfg.smoothing_alpha)
+                xentropy = optax.softmax_cross_entropy(logits, labels)
+                return jnp.mean(xentropy)
+            return cross_entropy_loss
+
         elif loss_type == "poly1_ce":
             logger.info(f"loss type: {loss_type}")
             def poly1_cross_entropy(logits, labels, epsilon=1.0):
@@ -155,8 +208,7 @@ def create_train_state(
         logits_fn=lambda logits: logits.argmax(-1),
         loss_fn=loss_fn,
     )
-
-
+    
 # define step functions
 def train_step(
     state: train_state.TrainState, batch: Dict[str, Array], dropout_rng: PRNGKey
@@ -223,6 +275,7 @@ if __name__ == "__main__":
     )
     # Setup logging, we only want one process per machine to log things on the screen.
     logger.setLevel(logging.INFO if jax.process_index() == 0 else logging.ERROR)
+    
     if jax.process_index() == 0:
         datasets.utils.logging.set_verbosity_warning()
         transformers.utils.logging.set_verbosity_info()
@@ -295,6 +348,18 @@ if __name__ == "__main__":
     steps_per_epoch = len(train_dataset) // train_batch_size
     total_steps = steps_per_epoch * num_epochs
     epochs = tqdm(range(num_epochs), desc=f"Epoch ... (0/{num_epochs})", position=0)
+
+    if cfg.wandb:
+        import wandb
+
+        def class2dict(f):
+            return dict((name, getattr(f, name)) for name in dir(f) if not name.startswith('__'))
+
+        run = wandb.init(project=cfg.model_name_or_path, 
+                        name=f'{cfg.model_name_or_path}-{cfg.seed}-{cfg.fold}-{cfg.experiment_suffix}',
+                        config=class2dict(cfg),
+                        group=cfg.model_name_or_path,
+                        job_type="train")
 
 
     # best metrics
@@ -391,6 +456,9 @@ if __name__ == "__main__":
                 comp_loss = log_loss(eval_labels, eval_preds)
 
                 logger.info(f"competition loss {comp_loss}")
+
+                if cfg.wandb:
+                    wandb.log({"eval_loss": eval_loss, "comp_loss": comp_loss, "learning_rate": train_metric['learning_rate']})
                 
                 # save best model
                 if comp_loss < best_loss:
