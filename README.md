@@ -1,0 +1,3 @@
+# jax-lm
+
+A tangled codebase I used during an NLP competition that I didn't continue working on. Majority of the code is borrowed from different bases from flax examples of huggingface, discussions, etc...
